@@ -59,6 +59,15 @@ type HTTPConfig struct {
 
 	// WriteEncoding specifies the encoding of write request
 	WriteEncoding ContentEncoding
+
+	// MaxIdleConns controls the maximum number of idle (keep-alive)
+	// connections across all hosts. Zero means no limit.
+	MaxIdleConns int
+
+	// MaxIdleConnsPerHost, if non-zero, controls the maximum idle
+	// (keep-alive) connections to keep per-host. If zero,
+	// DefaultMaxIdleConnsPerHost is used.
+	MaxIdleConnsPerHost int
 }
 
 // BatchPointsConfig is the config data needed to create an instance of the BatchPoints struct.
@@ -123,7 +132,9 @@ func NewHTTPClient(conf HTTPConfig) (Client, error) {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: conf.InsecureSkipVerify,
 		},
-		Proxy: conf.Proxy,
+		Proxy:               conf.Proxy,
+		MaxIdleConns:        conf.MaxIdleConns,
+		MaxIdleConnsPerHost: conf.MaxIdleConnsPerHost,
 	}
 	if conf.TLSConfig != nil {
 		tr.TLSClientConfig = conf.TLSConfig
