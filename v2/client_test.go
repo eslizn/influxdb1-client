@@ -3,6 +3,8 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/tinylib/msgp/msgp"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -979,5 +981,145 @@ func TestClient_ReadStatementId(t *testing.T) {
 
 	if r.Results[0].StatementId != 1 {
 		t.Fatalf("expected statement_id = 1, got %d", r.Results[0].StatementId)
+	}
+}
+
+func (r *Response) writeMsgpack(writer io.Writer) error {
+	enc := msgp.NewWriter(writer)
+	defer enc.Flush()
+
+	enc.WriteMapHeader(1)
+	if r.Error() != nil {
+		enc.WriteString("error")
+		enc.WriteString(r.Error().Error())
+		return nil
+	} else {
+		enc.WriteString("results")
+		enc.WriteArrayHeader(uint32(len(r.Results)))
+		for _, result := range r.Results {
+			if len(result.Err) > 0 {
+				enc.WriteMapHeader(1)
+				enc.WriteString("error")
+				enc.WriteString(result.Err)
+				continue
+			}
+
+			sz := 2
+			if len(result.Messages) > 0 {
+				sz++
+			}
+			if result.Partial {
+				sz++
+			}
+			enc.WriteMapHeader(uint32(sz))
+			enc.WriteString("statement_id")
+			enc.WriteInt(result.StatementId)
+			if len(result.Messages) > 0 {
+				enc.WriteString("messages")
+				enc.WriteArrayHeader(uint32(len(result.Messages)))
+				for _, msg := range result.Messages {
+					enc.WriteMapHeader(2)
+					enc.WriteString("level")
+					enc.WriteString(msg.Level)
+					enc.WriteString("text")
+					enc.WriteString(msg.Text)
+				}
+			}
+			enc.WriteString("series")
+			enc.WriteArrayHeader(uint32(len(result.Series)))
+			for _, series := range result.Series {
+				sz := 2
+				if series.Name != "" {
+					sz++
+				}
+				if len(series.Tags) > 0 {
+					sz++
+				}
+				if series.Partial {
+					sz++
+				}
+				enc.WriteMapHeader(uint32(sz))
+				if series.Name != "" {
+					enc.WriteString("name")
+					enc.WriteString(series.Name)
+				}
+				if len(series.Tags) > 0 {
+					enc.WriteString("tags")
+					enc.WriteMapHeader(uint32(len(series.Tags)))
+					for k, v := range series.Tags {
+						enc.WriteString(k)
+						enc.WriteString(v)
+					}
+				}
+				enc.WriteString("columns")
+				enc.WriteArrayHeader(uint32(len(series.Columns)))
+				for _, col := range series.Columns {
+					enc.WriteString(col)
+				}
+				enc.WriteString("values")
+				enc.WriteArrayHeader(uint32(len(series.Values)))
+				for _, values := range series.Values {
+					enc.WriteArrayHeader(uint32(len(values)))
+					for _, v := range values {
+						enc.WriteIntf(v)
+					}
+				}
+				if series.Partial {
+					enc.WriteString("partial")
+					enc.WriteBool(series.Partial)
+				}
+			}
+			if result.Partial {
+				enc.WriteString("partial")
+				enc.WriteBool(true)
+			}
+		}
+	}
+	return nil
+}
+
+func TestMsgpackClient_Query(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var data Response
+		w.Header().Set("Content-Type", r.Header.Get("Accept"))
+		w.WriteHeader(http.StatusOK)
+		data.writeMsgpack(w)
+	}))
+	defer ts.Close()
+
+	config := HTTPConfig{Addr: ts.URL, ContentType: ContentTypeMsgpack}
+	c, _ := NewHTTPClient(config)
+	defer c.Close()
+
+	query := Query{}
+	_, err := c.Query(query)
+	if err != nil {
+		t.Errorf("unexpected error.  expected %v, actual %v", nil, err)
+	}
+}
+
+func TestMsgpackClient_QueryAsChunk(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var data Response
+		w.Header().Set("Content-Type", r.Header.Get("Accept"))
+		w.Header().Set("X-Influxdb-Version", "1.3.1")
+		w.WriteHeader(http.StatusOK)
+		enc := json.NewEncoder(w)
+		_ = enc.Encode(data)
+		_ = enc.Encode(data)
+	}))
+	defer ts.Close()
+
+	config := HTTPConfig{Addr: ts.URL, ContentType: ContentTypeMsgpack}
+	c, err := NewHTTPClient(config)
+	if err != nil {
+		t.Fatalf("unexpected error.  expected %v, actual %v", nil, err)
+	}
+
+	query := Query{Chunked: true}
+	resp, err := c.QueryAsChunk(query)
+	defer resp.Close()
+	if err != nil {
+		t.Fatalf("unexpected error.  expected %v, actual %v", nil, err)
 	}
 }
