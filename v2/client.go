@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/tinylib/msgp/msgp"
 	"io"
 	"io/ioutil"
 	"mime"
@@ -26,6 +27,11 @@ type ContentEncoding string
 const (
 	DefaultEncoding ContentEncoding = ""
 	GzipEncoding    ContentEncoding = "gzip"
+)
+
+const (
+	ContentTypeJson    = "application/json"
+	ContentTypeMsgpack = "application/x-msgpack"
 )
 
 // HTTPConfig is the config data needed to create an HTTP Client.
@@ -68,6 +74,9 @@ type HTTPConfig struct {
 	// (keep-alive) connections to keep per-host. If zero,
 	// DefaultMaxIdleConnsPerHost is used.
 	MaxIdleConnsPerHost int
+
+	// ContentType specifies the codec of request
+	ContentType string
 }
 
 // BatchPointsConfig is the config data needed to create an instance of the BatchPoints struct.
@@ -148,8 +157,9 @@ func NewHTTPClient(conf HTTPConfig) (Client, error) {
 			Timeout:   conf.Timeout,
 			Transport: tr,
 		},
-		transport: tr,
-		encoding:  conf.WriteEncoding,
+		transport:   tr,
+		encoding:    conf.WriteEncoding,
+		contentType: conf.ContentType,
 	}, nil
 }
 
@@ -209,13 +219,14 @@ func (c *client) Close() error {
 type client struct {
 	// N.B - if url.UserInfo is accessed in future modifications to the
 	// methods on client, you will need to synchronize access to url.
-	url        url.URL
-	username   string
-	password   string
-	useragent  string
-	httpClient *http.Client
-	transport  *http.Transport
-	encoding   ContentEncoding
+	url         url.URL
+	username    string
+	password    string
+	useragent   string
+	httpClient  *http.Client
+	transport   *http.Transport
+	encoding    ContentEncoding
+	contentType string
 }
 
 // BatchPoints is an interface into a batched grouping of points to write into
@@ -546,6 +557,7 @@ type Result struct {
 	StatementId int `json:"statement_id"`
 	Series      []models.Row
 	Messages    []*Message
+	Partial     bool
 	Err         string `json:"error,omitempty"`
 }
 
@@ -573,6 +585,11 @@ func (c *client) Query(q Query) (*Response, error) {
 	}()
 
 	if err := checkResponse(resp); err != nil {
+		return nil, err
+	}
+
+	err = decodeResponse(resp)
+	if err != nil {
 		return nil, err
 	}
 
@@ -642,7 +659,30 @@ func (c *client) QueryAsChunk(q Query) (*ChunkedResponse, error) {
 	if err := checkResponse(resp); err != nil {
 		return nil, err
 	}
+
+	err = decodeResponse(resp)
+	if err != nil {
+		return nil, err
+	}
+
 	return NewChunkedResponse(resp.Body), nil
+}
+
+func decodeResponse(resp *http.Response) error {
+	if resp.Header.Get("Content-Type") == ContentTypeMsgpack {
+		buf := &bytes.Buffer{}
+		reader := msgp.NewReader(resp.Body)
+		_, err := reader.WriteToJSON(buf)
+		if err != nil {
+			return err
+		}
+		io.Copy(io.Discard, resp.Body) // https://github.com/influxdata/influxdb1-client/issues/58
+		resp.Body.Close()
+		resp.Body = io.NopCloser(buf)
+		resp.ContentLength = int64(buf.Len())
+		resp.Header.Set("Content-Type", ContentTypeJson)
+	}
+	return nil
 }
 
 func checkResponse(resp *http.Response) error {
@@ -660,7 +700,7 @@ func checkResponse(resp *http.Response) error {
 
 	// If we get an unexpected content type, then it is also not from influx direct and therefore
 	// we want to know what we received and what status code was returned for debugging purposes.
-	if cType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); cType != "application/json" {
+	if cType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); cType != ContentTypeJson && cType != ContentTypeMsgpack {
 		// Read up to 1kb of the body to help identify downstream errors and limit the impact of things
 		// like downstream serving a large file
 		body, err := ioutil.ReadAll(io.LimitReader(resp.Body, 1024))
@@ -687,7 +727,7 @@ func (c *client) createDefaultRequest(q Query) (*http.Request, error) {
 		return nil, err
 	}
 
-	req.Header.Set("Content-Type", "")
+	req.Header.Set("Accept", c.contentType)
 	req.Header.Set("User-Agent", c.useragent)
 
 	if c.username != "" {
