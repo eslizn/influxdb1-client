@@ -17,6 +17,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/influxdata/influxdb1-client/models"
@@ -77,6 +78,9 @@ type HTTPConfig struct {
 
 	// ContentType specifies the codec of request
 	ContentType string
+
+	// MaxLifespan, if non-zero, controls the maximum transport lifespan
+	MaxLifespan time.Duration
 }
 
 // BatchPointsConfig is the config data needed to create an instance of the BatchPoints struct.
@@ -115,6 +119,29 @@ type Client interface {
 	Close() error
 }
 
+// transportWithTTL wraps a http.Transport and provides TTL support.
+type transportWithTTL struct {
+	ttl     time.Duration
+	mu      sync.Mutex
+	native  *http.Transport
+	expired time.Time
+}
+
+// RoundTrip implements the http.RoundTripper interface.
+func (t *transportWithTTL) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.ttl > 0 {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		// Check if the current transport has expired.
+		if time.Now().After(t.expired) {
+			t.native.CloseIdleConnections()
+			t.native = t.native.Clone()
+			t.expired = time.Now().Add(t.ttl)
+		}
+	}
+	return t.native.RoundTrip(req)
+}
+
 // NewHTTPClient returns a new Client from the provided config.
 // Client is safe for concurrent use by multiple goroutines.
 func NewHTTPClient(conf HTTPConfig) (Client, error) {
@@ -137,16 +164,21 @@ func NewHTTPClient(conf HTTPConfig) (Client, error) {
 		return nil, fmt.Errorf("unsupported encoding %s", conf.WriteEncoding)
 	}
 
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: conf.InsecureSkipVerify,
+	tr := &transportWithTTL{
+		ttl: conf.MaxLifespan,
+		mu:  sync.Mutex{},
+		native: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: conf.InsecureSkipVerify,
+			},
+			Proxy:               conf.Proxy,
+			MaxIdleConns:        conf.MaxIdleConns,
+			MaxIdleConnsPerHost: conf.MaxIdleConnsPerHost,
 		},
-		Proxy:               conf.Proxy,
-		MaxIdleConns:        conf.MaxIdleConns,
-		MaxIdleConnsPerHost: conf.MaxIdleConnsPerHost,
+		expired: time.Now().Add(conf.MaxLifespan),
 	}
 	if conf.TLSConfig != nil {
-		tr.TLSClientConfig = conf.TLSConfig
+		tr.native.TLSClientConfig = conf.TLSConfig
 	}
 	return &client{
 		url:       *u,
@@ -157,7 +189,6 @@ func NewHTTPClient(conf HTTPConfig) (Client, error) {
 			Timeout:   conf.Timeout,
 			Transport: tr,
 		},
-		transport:   tr,
 		encoding:    conf.WriteEncoding,
 		contentType: conf.ContentType,
 	}, nil
@@ -210,7 +241,9 @@ func (c *client) Ping(timeout time.Duration) (time.Duration, string, error) {
 
 // Close releases the client's resources.
 func (c *client) Close() error {
-	c.transport.CloseIdleConnections()
+	if tp, ok := c.httpClient.Transport.(*transportWithTTL); ok && tp != nil {
+		tp.native.CloseIdleConnections()
+	}
 	return nil
 }
 
@@ -224,7 +257,6 @@ type client struct {
 	password    string
 	useragent   string
 	httpClient  *http.Client
-	transport   *http.Transport
 	encoding    ContentEncoding
 	contentType string
 }
